@@ -262,7 +262,8 @@ def test_webhook_integration(monkeypatch):
     response = client.post("/webhook", json=openwa_payload)
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "relayed"
+    assert data["status"] == "relaying"
+    assert data["message_id"] == "true_5491112345678@c.us_ABC"
 
 
 # ── Payload Golden Test (matching what the backend expects) ────

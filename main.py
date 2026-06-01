@@ -10,6 +10,7 @@ Architecture:
                  (HMAC)                        (X-API-Key)
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -19,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openwa-relay")
@@ -196,11 +197,38 @@ async def health():
     }
 
 
+async def _forward_to_backend(event_payload: dict, msg_id: str):
+    """Forward transformed event to backend. Runs in background; can take 60s+."""
+    backend_endpoint = f"{BACKEND_URL}/webhooks/execute/{WORKSPACE_ID}"
+    headers = {"Content-Type": "application/json"}
+    if BACKEND_API_KEY:
+        headers["X-API-Key"] = BACKEND_API_KEY
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        try:
+            resp = await client.post(
+                backend_endpoint,
+                params={"target": TARGET_FLOW, "mode": TARGET_MODE},
+                json=event_payload,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            logger.info(
+                f"Relayed → backend: {resp.status_code} "
+                f"msg_id={msg_id}"
+            )
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Backend rejected: {e.response.status_code} — {e.response.text[:300]}")
+        except Exception as e:
+            logger.error(f"Forward failed: {e}")
+
+
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
     """
     Receive OpenWA webhook POST.
-    Steps: verify signature → parse → transform → forward to backend.
+    Steps: verify signature → parse → transform → forward to backend (async).
+    Returns 200 OK immediately so OpenWA doesn't time out.
     """
     body = await request.body()
 
@@ -219,7 +247,6 @@ async def webhook(request: Request):
     event_type = payload.get("event", "")
     session_id = payload.get("sessionId", "")
     delivery_id = request.headers.get("X-OpenWA-Delivery-Id", "")
-    idempotency_key = request.headers.get("X-OpenWA-Idempotency-Key", "")
     retry_count = request.headers.get("X-OpenWA-Retry-Count", "0")
 
     logger.info(
@@ -234,44 +261,13 @@ async def webhook(request: Request):
 
     # 4. Transform
     event_payload = transform_to_event(payload, WORKSPACE_ID, session_id)
+    msg_id = payload.get("data", {}).get("id", "unknown")
 
-    # 5. Forward to backend
-    backend_endpoint = f"{BACKEND_URL}/webhooks/execute/{WORKSPACE_ID}"
-    headers = {"Content-Type": "application/json"}
-    if BACKEND_API_KEY:
-        headers["X-API-Key"] = BACKEND_API_KEY
+    # 5. Forward to backend ASYNCHRONOUSLY (fire-and-forget)
+    #    Returns 200 OK immediately; the flow may take 60+ seconds.
+    background_tasks.add_task(_forward_to_backend, event_payload, msg_id)
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            resp = await client.post(
-                backend_endpoint,
-                params={"target": TARGET_FLOW, "mode": TARGET_MODE},
-                json=event_payload,
-                headers=headers,
-            )
-            resp.raise_for_status()
-
-            logger.info(
-                f"Relayed → backend: {resp.status_code} "
-                f"msg_id={payload.get('data', {}).get('id')}"
-            )
-            return {
-                "status": "relayed",
-                "backend_status": resp.status_code,
-                "message_id": payload.get("data", {}).get("id"),
-            }
-
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Backend rejected: {e.response.status_code} — {e.response.text[:300]}")
-            return Response(
-                content=json.dumps({"status": "backend_error", "detail": str(e)}),
-                status_code=502,
-                media_type="application/json",
-            )
-        except Exception as e:
-            logger.error(f"Forward failed: {e}")
-            return Response(
-                content=json.dumps({"status": "error", "detail": str(e)}),
-                status_code=502,
-                media_type="application/json",
-            )
+    return {
+        "status": "relaying",
+        "message_id": msg_id,
+    }
