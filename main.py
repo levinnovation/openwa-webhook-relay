@@ -33,7 +33,8 @@ OPENWA_WEBHOOK_SECRET = os.environ.get("OPENWA_WEBHOOK_SECRET", "")
 WORKSPACE_ID          = os.environ.get("WORKSPACE_ID", "default")
 BACKEND_URL           = os.environ.get("BACKEND_URL", "http://localhost:8000").rstrip("/")
 BACKEND_API_KEY       = os.environ.get("BACKEND_API_KEY", "")
-TARGET_FLOW           = os.environ.get("TARGET_FLOW", "inbound_lead_flow")
+# Slug of a registered agent deployment (POST .../agent-deployments), not a legacy flow name.
+TARGET_FLOW           = os.environ.get("TARGET_FLOW", os.environ.get("TARGET_SLUG", "levi-cs"))
 TARGET_MODE           = os.environ.get("TARGET_MODE", "deterministic")
 
 
@@ -198,18 +199,45 @@ async def health():
 
 
 async def _forward_to_backend(event_payload: dict, msg_id: str):
-    """Forward transformed event to backend. Runs in background; can take 60s+."""
+    """
+    Forward the OpenWA event to the backend with a flat body.
+
+    The backend's `/webhooks/execute/{ws}` route treats the entire body as
+    `inputs` for the registered agent deployment. We therefore pass a flat
+    dict that includes `message` (the field the template's TemplateFlow
+    validates), plus contextual fields (source/from/raw) so the agent has
+    full event history.
+    """
     backend_endpoint = f"{BACKEND_URL}/webhooks/execute/{WORKSPACE_ID}"
     headers = {"Content-Type": "application/json"}
     if BACKEND_API_KEY:
         headers["X-API-Key"] = BACKEND_API_KEY
+
+    inner_payload = (event_payload.get("event") or {}).get("payload") or {}
+    flat_body = {
+        "message": inner_payload.get("content", ""),
+        "source": "whatsapp",
+        "from": inner_payload.get("from"),
+        "phone": inner_payload.get("phone"),
+        "profile_name": inner_payload.get("profile_name"),
+        "message_id": inner_payload.get("message_id"),
+        "type": inner_payload.get("type"),
+        "session_id": inner_payload.get("session_id"),
+        "media_url": inner_payload.get("media_url"),
+        "media_mime": inner_payload.get("media_mime"),
+        "media_caption": inner_payload.get("media_caption"),
+        "media_filename": inner_payload.get("media_filename"),
+        "raw": event_payload,
+    }
+    # Drop None values so the body stays minimal and predictable.
+    flat_body = {k: v for k, v in flat_body.items() if v is not None}
 
     async with httpx.AsyncClient(timeout=120) as client:
         try:
             resp = await client.post(
                 backend_endpoint,
                 params={"target": TARGET_FLOW, "mode": TARGET_MODE},
-                json=event_payload,
+                json=flat_body,
                 headers=headers,
             )
             resp.raise_for_status()
