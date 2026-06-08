@@ -9,8 +9,8 @@ OpenWA is a self-hosted WhatsApp gateway (built on Baileys) that supports outbou
 This relay:
 1. Receives OpenWA events (e.g. via OpenWA's internal event log or a sidecar that polls)
 2. Verifies the HMAC-SHA256 signature shared with the backend
-3. Transforms the OpenWA event into the format expected by the backend's `InboundLeadFlow` (CrewAI Flow: parse → classify → CRM → schedule → respond)
-4. Forwards the transformed payload to `POST /webhooks/execute/{workspace_id}?target=inbound_lead_flow` with the backend's API key
+3. Transforms the OpenWA event into the payload expected by a **registered agent deployment** on the control plane
+4. Forwards to `POST /webhooks/execute/{workspace_id}?target=<slug>` (deployment slug, e.g. `levi-cs`) with the backend API key
 5. Returns 200 OK immediately so OpenWA doesn't time out — the actual flow runs in a `BackgroundTasks` worker
 
 ## Architecture
@@ -25,12 +25,12 @@ This relay:
        ▼
 [openwa-webhook-relay]      ←── THIS SERVICE
        │ (HMAC-SHA256 signed, async background task)
-       │ (transforms OpenWA → InboundLeadFlow format)
+       │ (transforms OpenWA → agent run inputs)
        ▼
-[Backend /webhooks/execute/{ws}?target=inbound_lead_flow]
+[lev-agent-demo /webhooks/execute/{ws}?target=<slug>]
        │
        ▼
-[InboundLeadFlow]           ←── CrewAI Flow (parse → classify → CRM → schedule → respond)
+[Remote CrewAI template]    ←── HTTP POST /api/v1/run on Railway
        │
        ▼
 [Backend sends response via OpenWA]
@@ -56,7 +56,7 @@ Set these env vars in Railway:
 | `WORKSPACE_ID` | The workspace the relay forwards events for |
 | `BACKEND_URL` | URL of the lev-agent-demo backend (e.g. `https://apiagentsclientlev-production.up.railway.app`) |
 | `BACKEND_API_KEY` | `X-API-Key` for the backend |
-| `TARGET_FLOW` | Default: `inbound_lead_flow` |
+| `TARGET_FLOW` or `TARGET_SLUG` | Deployment slug registered in control plane (default: `levi-cs`) |
 | `TARGET_MODE` | Default: `deterministic` |
 
 ## Payload Transformation
